@@ -29,6 +29,6 @@
   "license": "LICENSE",
   "readme": "README.md",
   "url": "https://github.com/JIVIV/Accessibility-Roll-Reader/",
-  "manifest": "https://github.com/JIVIV/Accessibility-Roll-Reader/module.json",
-  "download": "https://github.com/your-name/a11y-roll-reader/releases/latest/download/module.zip"
+  "manifest": "https://raw.githubusercontent.com/JIVIV/Accessibility-Roll-Reader/refs/heads/main/module.json",
+  "download": "https://github.com/JIVIV/Accessibility-Roll-Reader/archive/refs/heads/main.zip"
 }

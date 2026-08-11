@@ -1,12 +1,13 @@
 import { MODULE_ID, SETTINGS } from './constants.js';
 import { speech } from './speech.js';
 import { describeMessage, isWhisper } from './parser.js';
-import { registerSettings, registerKeybindings, populateVoiceChoices } from './settings.js';
+import { registerSettings, registerKeybindings, populateVoiceChoices, registerPreviewFlush } from './settings.js';
 import { openGmPanel, registerSocket, showFirstRunHint } from './gm-control.js';
 
 Hooks.once( 'init', () => {
 	registerSettings();
 	registerKeybindings();
+	registerPreviewFlush();
 } );
 
 Hooks.once( 'ready', async () => {

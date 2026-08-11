@@ -22,6 +22,8 @@ class SpeechEngine {
 		this.lastVolume = null;
 		this._queue = [];
 		this._speaking = false;
+		this._generation = 0;
+		this._pendingSpeak = null;
 		this._warned = false;
 		this._lifecycleBound = false;
 	}
@@ -202,6 +204,12 @@ class SpeechEngine {
 		this.lastVolume = volume;
 
 		if ( interrupt ) {
+			// stop() also clears any speak still waiting on its settle
+			// timer, so a burst of interrupts collapses to just the last
+			// one. Saving the settings form fires onChange for several
+			// settings at once; without this each schedules its own
+			// preview and they all play, potentially resolving different
+			// voices as the writes land.
 			this.stop();
 
 			// cancel() empties the queue asynchronously. Calling speak()
@@ -209,11 +217,53 @@ class SpeechEngine {
 			// behind the one being cancelled, so the old announcement
 			// plays on and the "interrupt" appears to do nothing. Give
 			// the engine a tick to actually flush.
-			globalThis.setTimeout( () => this._enqueue( text, volume ), INTERRUPT_SETTLE_MS );
+			this._pendingSpeak = globalThis.setTimeout( () => {
+				this._pendingSpeak = null;
+				this._enqueue( text, volume );
+			}, INTERRUPT_SETTLE_MS );
 			return;
 		}
 
 		this._enqueue( text, volume );
+	}
+
+	/**
+	 * Speak several passages back to back as one announcement.
+	 *
+	 * Calling speak() twice would not do: the second call either
+	 * interrupts the first, or races ahead of it when the first is
+	 * still waiting on its settle timer.
+	 *
+	 * @param {Array<{text: string, volume?: number|null}>} items
+	 * @param {object}  [options]
+	 * @param {boolean} [options.interrupt]
+	 */
+	speakAll( items, { interrupt = false } = {} ) {
+		const parts = ( items ?? [] ).filter( ( i ) => i?.text );
+
+		if ( ! this.available || ! parts.length ) {
+			return;
+		}
+
+		this.lastSpoken = parts.map( ( i ) => i.text ).join( ' ' );
+		this.lastVolume = parts[ 0 ].volume ?? null;
+
+		const enqueueAll = () => {
+			for ( const part of parts ) {
+				this._enqueue( part.text, part.volume ?? null );
+			}
+		};
+
+		if ( interrupt ) {
+			this.stop();
+			this._pendingSpeak = globalThis.setTimeout( () => {
+				this._pendingSpeak = null;
+				enqueueAll();
+			}, INTERRUPT_SETTLE_MS );
+			return;
+		}
+
+		enqueueAll();
 	}
 
 	/**
@@ -256,23 +306,46 @@ class SpeechEngine {
 
 		this._speaking = true;
 
+		// Cancelling an utterance still fires its end/error handler, and
+		// that can land after the next announcement has already started.
+		// Tag each utterance with the generation it belongs to so a
+		// stale handler cannot advance or halt the current queue.
+		const generation = this._generation;
+
 		const utterance = new globalThis.SpeechSynthesisUtterance( next.text );
 		const voice = this.resolveVoice();
 
 		if ( voice ) {
+			// Set the voice only. Assigning lang as well makes some
+			// engines additionally dispatch to the default voice for
+			// that language, so every line gets spoken twice — once in
+			// the chosen voice and once in the system default. The
+			// voice already determines its own language.
 			utterance.voice = voice;
-			// Some engines pick a default language unless told.
-			utterance.lang = voice.lang;
 		}
 
 		utterance.rate = game.settings.get( MODULE_ID, SETTINGS.RATE );
 		utterance.pitch = game.settings.get( MODULE_ID, SETTINGS.PITCH );
 		utterance.volume = next.volume ?? game.settings.get( MODULE_ID, SETTINGS.VOLUME );
 
-		// 'error' also fires when an utterance is cancelled, at which
-		// point the queue is already empty and this simply settles.
-		utterance.onend = () => this._pump();
-		utterance.onerror = () => this._pump();
+		// Diagnostic: one line per utterance this module actually hands
+		// to the engine. If a line is heard twice but logged once, the
+		// duplication is the browser's, not ours — which is otherwise
+		// impossible to tell apart by ear.
+		console.debug(
+			`${ MODULE_ID } | speak`,
+			{ text: next.text, voice: voice?.name ?? '(browser default)', volume: utterance.volume }
+		);
+
+		const advance = () => {
+			if ( generation === this._generation ) {
+				this._pump();
+			}
+		};
+
+		// 'error' also fires when an utterance is cancelled.
+		utterance.onend = advance;
+		utterance.onerror = advance;
 
 		this.synth.speak( utterance );
 	}
@@ -282,8 +355,25 @@ class SpeechEngine {
 			return;
 		}
 
+		// Drop a speak that was queued behind a settle delay but has not
+		// started yet, otherwise it fires after this stop and speaks
+		// anyway.
+		if ( this._pendingSpeak ) {
+			globalThis.clearTimeout( this._pendingSpeak );
+			this._pendingSpeak = null;
+		}
+
 		this._queue = [];
 		this._speaking = false;
+		// Invalidate handlers belonging to anything already in flight.
+		this._generation++;
+
+		// Only cancel when there is something to cancel. A cancel on an
+		// idle engine is not free: on some browsers the next speak()
+		// after it gets dispatched twice.
+		if ( ! this.synth.speaking && ! this.synth.pending && ! this.synth.paused ) {
+			return;
+		}
 
 		// Cancelling while paused is unreliable on some engines.
 		if ( this.synth.paused ) {

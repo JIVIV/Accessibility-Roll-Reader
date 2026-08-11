@@ -28,13 +28,106 @@ const bool = ( key, defaultValue, onChange ) => ( {
 } );
 
 /**
- * Speak a sample whenever a voice setting changes, so someone tuning
- * the rate or picking a voice hears the result immediately instead of
- * having to go and roll dice to find out.
+ * Fallback delay before speaking a sample.
+ *
+ * Normally the sample fires the moment the settings form closes, which
+ * is both immediate and unambiguous. This timer only covers changes
+ * made outside that form — a GM pushing settings over the socket, or a
+ * macro calling game.settings.set directly — where no close event is
+ * coming. It is deliberately generous: under 'user' scope every write
+ * is a server round-trip, so onChange callbacks arrive hundreds of
+ * milliseconds apart rather than in one tick, and a short window lets
+ * an early sample start before the later values have landed.
  */
-function previewVoice() {
-	speech.speak( game.i18n.localize( `${ MODULE_ID }.speech.preview` ), { interrupt: true } );
+const PREVIEW_FALLBACK_MS = 1500;
+
+/**
+ * Settling time after the form closes, to let the last write resolve
+ * before the voice is read for playback.
+ */
+const PREVIEW_SETTLE_MS = 150;
+
+let previewTimer = null;
+const pendingPreview = { announcement: false, whisper: false };
+
+/**
+ * Speak a sample once the dust settles, so someone tuning the rate or
+ * picking a voice hears the result immediately instead of having to go
+ * and roll dice to find out.
+ *
+ * @param {object}  [options]
+ * @param {boolean} [options.announcement] Include the normal sample.
+ * @param {boolean} [options.whisper]      Include a whispered sample.
+ */
+function schedulePreview( { announcement = false, whisper = false } = {} ) {
+	pendingPreview.announcement = pendingPreview.announcement || announcement;
+	pendingPreview.whisper = pendingPreview.whisper || whisper;
+
+	globalThis.clearTimeout( previewTimer );
+	previewTimer = globalThis.setTimeout( () => flushPreview(), PREVIEW_FALLBACK_MS );
 }
+
+/**
+ * Speak whatever samples are pending, if any.
+ *
+ * Reading the volume and voice here rather than when the change was
+ * queued means the sample always reflects the values that actually
+ * ended up stored.
+ *
+ * @param {number} [delay] Settling time before speaking.
+ */
+export function flushPreview( delay = 0 ) {
+	if ( ! pendingPreview.announcement && ! pendingPreview.whisper ) {
+		return;
+	}
+
+	globalThis.clearTimeout( previewTimer );
+	previewTimer = null;
+
+	const wantsAnnouncement = pendingPreview.announcement;
+	const wantsWhisper = pendingPreview.whisper;
+
+	pendingPreview.announcement = false;
+	pendingPreview.whisper = false;
+
+	const speakNow = () => {
+		const items = [];
+
+		if ( wantsAnnouncement ) {
+			items.push( { text: game.i18n.localize( `${ MODULE_ID }.speech.preview` ), volume: null } );
+		}
+
+		if ( wantsWhisper ) {
+			items.push( {
+				text: game.i18n.localize( `${ MODULE_ID }.speech.whisperPreview` ),
+				volume: game.settings.get( MODULE_ID, SETTINGS.WHISPER_VOLUME ),
+			} );
+		}
+
+		speech.speakAll( items, { interrupt: true } );
+	};
+
+	if ( delay > 0 ) {
+		globalThis.setTimeout( speakNow, delay );
+		return;
+	}
+
+	speakNow();
+}
+
+/**
+ * Speak the pending sample as soon as the settings form is dismissed.
+ *
+ * Foundry has no hook for "all settings finished saving", so the close
+ * of the form is the nearest reliable signal that the user is done —
+ * and it beats guessing at a delay, which either fires mid-save or
+ * leaves a lag after every change.
+ */
+export function registerPreviewFlush() {
+	Hooks.on( 'closeSettingsConfig', () => flushPreview( PREVIEW_SETTLE_MS ) );
+}
+
+const previewVoice = () => schedulePreview( { announcement: true } );
 
 export function registerSettings() {
 	// Registered first so the button sits at the top of the module's
@@ -44,9 +137,11 @@ export function registerSettings() {
 	// Every setting is per-person, never world-scoped: this is a
 	// personal accessibility aid, so one player enabling it must not
 	// switch it on for the whole table.
-	// Turning it on confirms itself out loud. Someone who cannot see the
-	// checkbox needs to hear that it worked, and it doubles as a check
-	// that speech is available on this device at all.
+	// Turning it on demonstrates itself: one normal sample and one
+	// whispered, so a player hears what announcements sound like and how
+	// whispers are set apart. It also confirms speech works on this
+	// device at all, which someone who cannot see the checkbox has no
+	// other way to check.
 	game.settings.register(
 		MODULE_ID,
 		SETTINGS.ENABLED,
@@ -57,7 +152,7 @@ export function registerSettings() {
 			}
 
 			speech.warnIfUnavailable();
-			speech.speak( game.i18n.localize( `${ MODULE_ID }.speech.enabled` ), { interrupt: true } );
+			schedulePreview( { announcement: true, whisper: true } );
 		} )
 	);
 	game.settings.register( MODULE_ID, SETTINGS.ANNOUNCE_ROLLS, bool( SETTINGS.ANNOUNCE_ROLLS, true ) );
@@ -126,11 +221,7 @@ export function registerSettings() {
 		type: Number,
 		default: 1,
 		range: { min: 0, max: 1, step: 0.05 },
-		onChange: ( value ) =>
-			speech.speak( game.i18n.localize( `${ MODULE_ID }.speech.whisperPreview` ), {
-				interrupt: true,
-				volume: value,
-			} ),
+		onChange: () => schedulePreview( { whisper: true } ),
 	} );
 
 	// Not shown in the UI; just remembers whether the GM has been told
